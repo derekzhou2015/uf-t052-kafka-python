@@ -1,0 +1,344 @@
+import uuid
+
+import pytest
+
+from kafka.admin import KafkaAdminClient, NewTopic, NewPartitions
+from kafka.errors import KafkaTimeoutError, UnknownTopicOrPartitionError
+from kafka.protocol.admin import (
+    CreateTopicsRequest,
+    CreateTopicsResponse,
+    DeleteTopicsRequest,
+    DeleteTopicsResponse,
+)
+from kafka.protocol.metadata import MetadataRequest, MetadataResponse
+
+
+def test_new_partitions():
+    good_partitions = NewPartitions(6)
+    assert good_partitions.total_count == 6
+    assert good_partitions.new_assignments is None
+    good_partitions = NewPartitions(7, [[1, 2, 3]])
+    assert good_partitions.total_count == 7
+    assert good_partitions.new_assignments == [[1, 2, 3]]
+
+
+def test_process_create_partitions_input_auto_assign_is_null():
+    # When the caller does not supply manual replica assignments, the request's
+    # `assignments` field must be None so it serialises to null (broker
+    # auto-assigns). An empty list [] serialises to a present-but-empty array,
+    # which the broker reads as "manual assignment" and rejects with
+    # InvalidReplicationAssignmentError. See issue #3146.
+    proc = KafkaAdminClient._process_create_partitions_input
+
+    # int total-count -> auto-assign
+    topics = proc({'foo': 6})
+    assert len(topics) == 1
+    assert topics[0].name == 'foo'
+    assert topics[0].count == 6
+    assert topics[0].assignments is None
+
+    # bare NewPartitions with no manual assignments -> auto-assign
+    topics = proc({'foo': NewPartitions(6)})
+    assert topics[0].assignments is None
+
+
+def test_process_create_partitions_input_manual_assignments():
+    # Explicit manual assignments must be preserved, for both the dict form
+    # and the (deprecated) NewPartitions form.
+    proc = KafkaAdminClient._process_create_partitions_input
+
+    topics = proc({'foo': {'count': 7, 'assignments': [[1, 2, 3]]}})
+    assert topics[0].count == 7
+    assert [a.broker_ids for a in topics[0].assignments] == [[1, 2, 3]]
+
+    topics = proc({'foo': NewPartitions(7, [[1, 2, 3]])})
+    assert topics[0].count == 7
+    assert [a.broker_ids for a in topics[0].assignments] == [[1, 2, 3]]
+
+
+def test_new_topic():
+    good_topic = NewTopic('foo')
+    assert good_topic.name == 'foo'
+    assert good_topic.num_partitions == -1
+    assert good_topic.replication_factor == -1
+    assert good_topic.replica_assignments == {}
+    assert good_topic.topic_configs == {}
+
+    good_topic = NewTopic('foo', 1)
+    assert good_topic.name == 'foo'
+    assert good_topic.num_partitions == 1
+    assert good_topic.replication_factor == -1
+    assert good_topic.replica_assignments == {}
+    assert good_topic.topic_configs == {}
+
+    good_topic = NewTopic('foo', 1, 1, {1: [1, 1, 1]})
+    assert good_topic.name == 'foo'
+    assert good_topic.num_partitions == 1
+    assert good_topic.replication_factor == 1
+    assert good_topic.replica_assignments == {1: [1, 1, 1]}
+    assert good_topic.topic_configs == {}
+
+    good_topic = NewTopic('foo', 1, 2)
+    assert good_topic.name == 'foo'
+    assert good_topic.num_partitions == 1
+    assert good_topic.replication_factor == 2
+    assert good_topic.replica_assignments == {}
+    assert good_topic.topic_configs == {}
+
+    good_topic = NewTopic('bar', -1, -1, {1: [1, 2, 3]}, {'key': 'value'})
+    assert good_topic.name == 'bar'
+    assert good_topic.num_partitions == -1
+    assert good_topic.replication_factor == -1
+    assert good_topic.replica_assignments == {1: [1, 2, 3]}
+    assert good_topic.topic_configs == {'key': 'value'}
+
+
+# ---------------------------------------------------------------------------
+# _topic_not_ready_reason (pure function, no network)
+# ---------------------------------------------------------------------------
+
+
+def _ready_topic(name='foo', num_partitions=1):
+    return {
+        'name': name,
+        'error_code': 0,
+        'partitions': [
+            {'error_code': 0, 'partition_index': i, 'leader_id': 0}
+            for i in range(num_partitions)
+        ],
+    }
+
+
+def test_topic_not_ready_reason_missing():
+    assert KafkaAdminClient._topic_not_ready_reason(None) == 'missing from metadata response'
+
+
+def test_topic_not_ready_reason_topic_error():
+    assert KafkaAdminClient._topic_not_ready_reason(
+        {'name': 'foo', 'error_code': 3, 'partitions': []}
+    ) == 'UnknownTopicOrPartitionError'
+
+
+def test_topic_not_ready_reason_no_partitions():
+    assert KafkaAdminClient._topic_not_ready_reason(
+        {'name': 'foo', 'error_code': 0, 'partitions': []}
+    ) == 'no partitions reported'
+
+
+def test_topic_not_ready_reason_no_leader():
+    assert KafkaAdminClient._topic_not_ready_reason(
+        {'name': 'foo', 'error_code': 0, 'partitions': [
+            {'error_code': 0, 'partition_index': 0, 'leader_id': -1},
+            {'error_code': 0, 'partition_index': 1, 'leader_id': 0},
+        ]}
+    ) == 'p0=no leader'
+
+
+def test_topic_not_ready_reason_partition_error():
+    assert KafkaAdminClient._topic_not_ready_reason(
+        {'name': 'foo', 'error_code': 0, 'partitions': [
+            {'error_code': 5, 'partition_index': 0, 'leader_id': -1},
+        ]}
+    ) == 'p0=LeaderNotAvailableError'
+
+
+def test_topic_not_ready_reason_partial_partition_errors():
+    # Multiple partitions each with their own issue -> all reasons joined.
+    reason = KafkaAdminClient._topic_not_ready_reason(
+        {'name': 'foo', 'error_code': 0, 'partitions': [
+            {'error_code': 0, 'partition_index': 0, 'leader_id': -1},
+            {'error_code': 5, 'partition_index': 1, 'leader_id': -1},
+        ]}
+    )
+    assert 'p0=no leader' in reason
+    assert 'p1=LeaderNotAvailableError' in reason
+
+
+def test_topic_not_ready_reason_ready():
+    assert KafkaAdminClient._topic_not_ready_reason(_ready_topic()) is None
+
+
+# ---------------------------------------------------------------------------
+# wait_for_topics (mocks describe_topics; does not hit the network)
+# ---------------------------------------------------------------------------
+
+
+def _bare_admin():
+    """Return a KafkaAdminClient instance without running __init__ (which
+    would try to bootstrap a real broker). All attributes needed by the
+    method under test are provided by the test.
+    """
+    return object.__new__(KafkaAdminClient)
+
+
+def test_wait_for_topics_empty_list_returns_immediately():
+    admin = _bare_admin()
+    # No describe_topics monkey-patch: if it were called the test would
+    # crash with AttributeError, proving the empty-list fast path.
+    admin.wait_for_topics([])
+
+
+def test_wait_for_topics_ready_on_first_call(monkeypatch):
+    admin = _bare_admin()
+    calls = []
+    def fake_describe_topics(topics):
+        calls.append(topics)
+        return [_ready_topic(name=t, num_partitions=2) for t in topics]
+    monkeypatch.setattr(admin, 'describe_topics', fake_describe_topics)
+    admin.wait_for_topics(['foo', 'bar'], timeout_ms=1000)
+    assert len(calls) == 1
+    assert set(calls[0]) == {'foo', 'bar'}
+
+
+def test_wait_for_topics_becomes_ready_after_retry(monkeypatch):
+    admin = _bare_admin()
+    responses = [
+        # First call: topic missing
+        [],
+        # Second call: topic exists but no leader yet
+        [{'name': 'foo', 'error_code': 0, 'partitions': [
+            {'error_code': 0, 'partition_index': 0, 'leader_id': -1}]}],
+        # Third call: ready
+        [_ready_topic(name='foo')],
+    ]
+    def fake_describe_topics(topics):
+        return responses.pop(0)
+    monkeypatch.setattr(admin, 'describe_topics', fake_describe_topics)
+    admin.wait_for_topics(['foo'], timeout_ms=5000)
+    assert responses == []  # all three calls consumed
+
+
+def test_wait_for_topics_timeout(monkeypatch):
+    admin = _bare_admin()
+    def fake_describe_topics(topics):
+        return [{'name': 'foo', 'error_code': 3, 'partitions': []}]
+    monkeypatch.setattr(admin, 'describe_topics', fake_describe_topics)
+    with pytest.raises(KafkaTimeoutError) as exc_info:
+        admin.wait_for_topics(['foo'], timeout_ms=200)
+    assert 'foo' in str(exc_info.value)
+    assert 'UnknownTopicOrPartitionError' in str(exc_info.value)
+
+
+def test_wait_for_topics_describe_exception_keeps_retrying(monkeypatch):
+    """A transient exception from describe_topics should be logged and
+    retried, not propagated - otherwise a flaky broker could turn a
+    recoverable wait into a hard failure."""
+    admin = _bare_admin()
+    state = {'calls': 0}
+    def fake_describe_topics(topics):
+        state['calls'] += 1
+        if state['calls'] == 1:
+            raise RuntimeError('transient')
+        return [_ready_topic(name=t) for t in topics]
+    monkeypatch.setattr(admin, 'describe_topics', fake_describe_topics)
+    admin.wait_for_topics(['foo'], timeout_ms=5000)
+    assert state['calls'] == 2
+
+
+# ---------------------------------------------------------------------------
+# KIP-516: topic UUIDs in admin requests/responses
+# ---------------------------------------------------------------------------
+
+
+class TestTopicIdAdmin:
+    """KIP-516 topic ids in the admin surface: delete-by-id, describe-by-id,
+    and CreateTopics surfacing topic_id from v7+ responses."""
+
+    def test_delete_topics_by_id_encodes_topic_id(self, broker, admin):
+        """delete_topics already accepts uuid.UUID items; pin the wire shape."""
+        captured = {}
+
+        def handler(api_key, api_version, correlation_id, request_bytes):
+            decoded = DeleteTopicsRequest.decode(
+                request_bytes, version=api_version, header=True)
+            captured['request'] = decoded
+            captured['version'] = api_version
+            return DeleteTopicsResponse(throttle_time_ms=0, responses=[])
+
+        broker.respond_fn(DeleteTopicsRequest, handler)
+
+        u = uuid.uuid4()
+        admin.delete_topics([u])
+
+        req = captured['request']
+        # v6+ uses the structured DeleteTopicState carrying topic_id.
+        assert captured['version'] >= 6
+        assert len(req.topics) == 1
+        assert req.topics[0].topic_id == u
+        assert req.topics[0].name is None
+
+    def test_describe_topics_by_id_sends_topic_id(self, broker, admin):
+        captured = {}
+
+        def handler(api_key, api_version, correlation_id, request_bytes):
+            decoded = MetadataRequest.decode(
+                request_bytes, version=api_version, header=True)
+            captured['request'] = decoded
+            captured['version'] = api_version
+            return MetadataResponse(throttle_time_ms=0, brokers=[], cluster_id='c',
+                                    controller_id=0, topics=[])
+
+        broker.respond_fn(MetadataRequest, handler)
+
+        u = uuid.uuid4()
+        admin.describe_topics([u])
+
+        req = captured['request']
+        # MetadataRequest must be v12+ for name=null + topic_id to work.
+        assert captured['version'] >= 12
+        assert len(req.topics) == 1
+        assert req.topics[0].topic_id == u
+        assert req.topics[0].name is None
+
+    def test_describe_topics_mixed_name_and_id(self, broker, admin):
+        captured = {}
+
+        def handler(api_key, api_version, correlation_id, request_bytes):
+            decoded = MetadataRequest.decode(
+                request_bytes, version=api_version, header=True)
+            captured['request'] = decoded
+            return MetadataResponse(throttle_time_ms=0, brokers=[], cluster_id='c',
+                                    controller_id=0, topics=[])
+
+        broker.respond_fn(MetadataRequest, handler)
+
+        u = uuid.uuid4()
+        admin.describe_topics(['by-name', u])
+
+        req = captured['request']
+        assert len(req.topics) == 2
+        assert req.topics[0].name == 'by-name'
+        assert req.topics[0].topic_id is None
+        assert req.topics[1].name is None
+        assert req.topics[1].topic_id == u
+
+    def test_create_topics_negotiates_v7_and_surfaces_topic_id(self, broker, admin):
+        """With max_version=3 dropped, negotiation should reach v7+ on a
+        modern MockBroker and the response's topic_id flows through to_dict()."""
+        captured = {}
+        u = uuid.uuid4()
+
+        def handler(api_key, api_version, correlation_id, request_bytes):
+            captured['version'] = api_version
+            _Result = CreateTopicsResponse.CreatableTopicResult
+            return CreateTopicsResponse(
+                throttle_time_ms=0,
+                topics=[_Result(
+                    name='foo',
+                    topic_id=u,
+                    error_code=0,
+                    error_message=None,
+                    num_partitions=1,
+                    replication_factor=1,
+                    configs=[],
+                )],
+            )
+
+        broker.respond_fn(CreateTopicsRequest, handler)
+
+        result = admin.create_topics({'foo': {'num_partitions': 1, 'replication_factor': 1}})
+
+        # Default MockBroker is (4, 2); negotiation should land on v7+.
+        assert captured['version'] >= 7
+        # to_dict() stringifies the UUID; compare via uuid.UUID round-trip.
+        assert uuid.UUID(result['topics'][0]['topic_id']) == u

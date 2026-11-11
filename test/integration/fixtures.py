@@ -1,0 +1,855 @@
+import atexit
+import base64
+import hashlib
+import logging
+import random
+import os
+import os.path
+import socket
+import subprocess
+import sys
+import time
+from urllib.parse import urlparse
+import uuid
+
+import py
+
+from kafka import errors, KafkaAdminClient
+from kafka.errors import InvalidReplicationFactorError
+from kafka.net.backend import list_backends
+from test.testutil import env_kafka_version, random_string
+from test.service import ExternalService, SpawnedService
+
+log = logging.getLogger(__name__)
+
+
+_UNRESOLVED = object()
+_selected_net_cache = _UNRESOLVED
+
+
+def _git_revision():
+    """Commit SHA for deterministic backend selection: ``GITHUB_SHA`` in CI,
+    else ``git rev-parse HEAD``, else None (e.g. a source tarball with no git)."""
+    sha = os.environ.get('GITHUB_SHA')
+    if sha:
+        return sha
+    try:
+        return subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL).decode().strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _spread_net(sha=None, python=None, kafka=None):
+    """Deterministically pick a backend, spread across the CI matrix.
+
+    Seeds the choice with the commit SHA *and* the per-job matrix variables
+    (Python major.minor + KAFKA_VERSION). Every job in one CI run shares the
+    same ``GITHUB_SHA``, so the matrix vars are what fan the ~17 jobs out across
+    backends within that run; the SHA reshuffles the assignment on later commits,
+    so each (python, kafka) cell covers every backend over time. A given
+    (commit, python, kafka) always picks the same backend -- reproducible on
+    re-run. ``hashlib`` (not the salted builtin ``hash()``) keeps it stable
+    across processes.
+    """
+    backends = sorted(list_backends())
+    sha = (_git_revision() or 'no-sha') if sha is None else sha
+    python = ('%d.%d' % sys.version_info[:2]) if python is None else python
+    kafka = os.environ.get('KAFKA_VERSION', '') if kafka is None else kafka
+    seed = '%s:%s:%s' % (sha, python, kafka)
+    idx = int(hashlib.sha256(seed.encode()).hexdigest(), 16) % len(backends)
+    net = backends[idx]
+    log.warning('KAFKA_PYTHON_NET=random -> net=%r (seed: sha=%s python=%s '
+                'kafka=%s; re-run with KAFKA_PYTHON_NET=%s to reproduce)',
+                net, sha[:12], python, kafka or '-', net)
+    return net
+
+
+def _selected_net():
+    """Resolve the KAFKA_PYTHON_NET override once per run, and log the choice.
+
+    ``KAFKA_PYTHON_NET=random`` picks a backend *once* (not per client) so the
+    whole run uses one backend, spread across the matrix (see ``_spread_net``).
+    Any other value pins that backend. Returns the backend name, or '' when
+    unset (default selector).
+    """
+    global _selected_net_cache
+    if _selected_net_cache is _UNRESOLVED:
+        net = os.environ.get('KAFKA_PYTHON_NET') or ''
+        if net == 'random':
+            net = _spread_net()
+        elif net:
+            log.info('KAFKA_PYTHON_NET=%r: running against the %r net backend',
+                     net, net)
+        _selected_net_cache = net
+    return _selected_net_cache
+
+
+def create_topics(broker, topic_names, num_partitions=None, replication_factor=None):
+    """Create topics on the given broker fixture.
+
+    Uses KafkaAdminClient for Kafka 0.10.1+, falls back to CLI.
+    """
+    if num_partitions is None:
+        num_partitions = broker.partitions
+    if replication_factor is None:
+        replication_factor = broker.replicas
+    if env_kafka_version() >= (0, 10, 1, 0):
+        _create_topics_via_admin(broker, topic_names, num_partitions, replication_factor)
+    else:
+        for topic_name in topic_names:
+            # TODO: verify kafka-topics.sh support for early 0.8 brokers
+            broker._create_topic_via_cli(topic_name, num_partitions, replication_factor)
+        _wait_for_topics(broker, topic_names)
+
+
+def _create_topics_via_admin(broker, topic_names, num_partitions, replication_factor):
+    params = broker._enrich_client_params({'api_version': env_kafka_version(), 'client_id': 'topic_creator'})
+    with KafkaAdminClient(**params) as admin:
+        try:
+            topics = {name: {'num_partitions': num_partitions, 'replication_factor': replication_factor}
+                      for name in topic_names}
+            admin.create_topics(topics, wait_for_metadata=True)
+        except InvalidReplicationFactorError:
+            # wait and try again
+            # in CI the brokers sometimes take a while to find themselves
+            time.sleep(0.5)
+            topics = {name: {'num_partitions': num_partitions, 'replication_factor': replication_factor}
+                      for name in topic_names}
+            admin.create_topics(topics, wait_for_metadata=True)
+
+
+def _wait_for_topics(broker, topics):
+    params = broker._enrich_client_params({'api_version': env_kafka_version(), 'client_id': 'topic_creator'})
+    with KafkaAdminClient(**params) as admin:
+        admin.wait_for_topics(topics)
+
+
+def client_params(broker, client_id='client', **overrides):
+    """Build connection params for a client from a broker fixture."""
+    return broker._enrich_client_params(overrides, client_id='%s_%s' % (client_id, random_string(4)))
+
+
+def _extract_topic_command_error(stdout):
+    """Extract the error line from kafka-topics.sh output."""
+    for line in stdout.decode('utf-8', errors='replace').splitlines():
+        if line.startswith('Error while executing topic command'):
+            return line
+    return ''
+
+
+def get_open_port():
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def gen_ssl_resources(directory):
+    os.system("""
+    cd {0}
+    echo Generating SSL resources in {0}
+
+    # Step 1: Generate server keystore
+    keytool -keystore kafka.server.keystore.jks -alias localhost -validity 1 \
+      -genkey -keyalg RSA -storepass foobar -keypass foobar \
+      -dname "CN=localhost, OU=kafka-python, O=kafka-python, L=SF, ST=CA, C=US" \
+      -ext SAN=dns:localhost
+
+    # Step 2: Generate CA and truststore
+    openssl genrsa -out ca-key 2048
+    openssl req -new -x509 -key ca-key -out ca-cert -days 1 \
+      -subj "/C=US/ST=CA/O=MyOrg, Inc./CN=mydomain.com" \
+      -addext "keyUsage=critical,keyCertSign,cRLSign"
+    keytool -keystore kafka.server.truststore.jks -alias CARoot -import \
+      -file ca-cert -storepass foobar -noprompt
+
+    # Step 3: Sign server cert with CA
+    keytool -keystore kafka.server.keystore.jks -alias localhost -certreq \
+      -file cert-file -storepass foobar
+    openssl x509 -req -CA ca-cert -CAkey ca-key -in cert-file -out cert-signed \
+      -days 1 -CAcreateserial -passin pass:foobar
+    keytool -keystore kafka.server.keystore.jks -alias CARoot -import \
+      -file ca-cert -storepass foobar -noprompt
+    keytool -keystore kafka.server.keystore.jks -alias localhost -import \
+      -file cert-signed -storepass foobar -noprompt
+    """.format(directory))
+
+
+class Fixture:
+    kafka_version = os.environ.get('KAFKA_VERSION', '4.2.0')
+    project_root = os.environ.get('PROJECT_ROOT',
+                                  os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+    kafka_root = os.environ.get("KAFKA_ROOT",
+                                os.path.join(project_root, 'servers', kafka_version, "kafka-bin"))
+
+    def __init__(self):
+        self.child = None
+        if not os.path.isdir(self.kafka_root):
+            raise FileNotFoundError(self.kafka_root)
+
+    @classmethod
+    def test_resource(cls, filename):
+        path = os.path.join(cls.project_root, "servers", cls.kafka_version, "resources", filename)
+        if os.path.isfile(path):
+            return path
+        if env_kafka_version() < (1, 0):
+            one_resource = os.path.join(cls.project_root, "servers", "resources", "0.0", filename)
+            if os.path.isfile(one_resource):
+                return one_resource
+        elif env_kafka_version() < (4, 0):
+            one_resource = os.path.join(cls.project_root, "servers", "resources", "1.0", filename)
+            if os.path.isfile(one_resource):
+                return one_resource
+        return os.path.join(cls.project_root, "servers", "resources", "default", filename)
+
+    @classmethod
+    def run_script(cls, script, *args):
+        result = [os.path.join(cls.kafka_root, 'bin', script)]
+        result.extend([str(arg) for arg in args])
+        return result
+
+    @classmethod
+    def kafka_run_class_args(cls, *args):
+        result = [os.path.join(cls.kafka_root, 'bin', 'kafka-run-class.sh')]
+        result.extend([str(arg) for arg in args])
+        return result
+
+    def kafka_run_class_env(self):
+        env = os.environ.copy()
+        env['KAFKA_LOG4J_OPTS'] = "-Dlog4j.configuration=file:%s" % \
+                                  (self.test_resource("log4j.properties"),)
+        return env
+
+    @classmethod
+    def render_template(cls, source_file, target_file, binding):
+        log.info('Rendering %s from template %s', target_file.strpath, source_file)
+        with open(source_file, "r") as handle:
+            template = handle.read()
+            assert len(template) > 0, 'Empty template %s' % (source_file,)
+        with open(target_file.strpath, "w") as handle:
+            handle.write(template.format(**binding))
+            handle.flush()
+            os.fsync(handle)
+
+        # fsync directory for durability
+        # https://blog.gocept.com/2013/07/15/reliable-file-updates-with-python/
+        dirfd = os.open(os.path.dirname(target_file.strpath), os.O_DIRECTORY)
+        os.fsync(dirfd)
+        os.close(dirfd)
+        log.debug("Template string:")
+        for line in template.splitlines():
+            log.debug('  ' + line.strip())
+        log.debug("Rendered template:")
+        with open(target_file.strpath, 'r') as o:
+            for line in o:
+                log.debug('  ' + line.strip())
+        log.debug("binding:")
+        for key, value in binding.items():
+            log.debug("  {key}={value}".format(key=key, value=value))
+
+    def dump_logs(self):
+        self.child.dump_logs()
+
+
+class ZookeeperFixture(Fixture):
+    @classmethod
+    def instance(cls, host=None, port=None, external=False):
+        if host is None:
+            host = "127.0.0.1"
+        fixture = cls(host, port, external=external)
+        try:
+            fixture.open()
+        except:
+            fixture.close()
+            raise
+        return fixture
+
+    def __init__(self, host, port, external=False, tmp_dir=None):
+        super().__init__()
+        self.host = host
+        self.port = port
+        self.running = external
+        self.tmp_dir = tmp_dir
+
+    def kafka_run_class_env(self):
+        env = super().kafka_run_class_env()
+        env['LOG_DIR'] = self.tmp_dir.join('logs').strpath
+        return env
+
+    def out(self, message):
+        if len(log.handlers) > 0:
+            log.info("*** Zookeeper [%s:%s]: %s", self.host, self.port or '(auto)', message)
+
+    def open(self):
+        if self.running:
+            return
+        if self.tmp_dir is None:
+            self.tmp_dir = py.path.local.mkdtemp() #pylint: disable=no-member
+        self.tmp_dir.ensure(dir=True)
+
+        self.out("Running local instance...")
+        log.info("  host    = %s", self.host)
+        log.info("  port    = %s", self.port or '(auto)')
+        log.info("  tmp_dir = %s", self.tmp_dir.strpath)
+
+        # Configure Zookeeper child process
+        template = self.test_resource("zookeeper.properties")
+        properties = self.tmp_dir.join("zookeeper.properties")
+        # Consider replacing w/ run_script('zookeper-server-start.sh', ...)
+        args = self.kafka_run_class_args("org.apache.zookeeper.server.quorum.QuorumPeerMain",
+                                         properties.strpath)
+        env = self.kafka_run_class_env()
+
+        # Party!
+        timeout = 5
+        max_timeout = 120
+        backoff = 1
+        end_at = time.time() + max_timeout
+        tries = 1
+        auto_port = (self.port is None)
+        while time.time() < end_at:
+            if auto_port:
+                self.port = get_open_port()
+            self.out('Attempting to start on port %d (try #%d)' % (self.port, tries))
+            self.render_template(template, properties, vars(self))
+            self.child = SpawnedService(args, env)
+            self.child.start()
+            timeout = min(timeout, max(end_at - time.time(), 0))
+            if self.child.wait_for(r"binding to port", timeout=timeout):
+                break
+            self.child.dump_logs()
+            self.child.stop()
+            timeout *= 2
+            time.sleep(backoff)
+            tries += 1
+            backoff += 1
+        else:
+            raise RuntimeError('Failed to start Zookeeper before max_timeout')
+        self.out("Done!")
+        atexit.register(self.close)
+
+    def close(self):
+        if self.child is None:
+            return
+        self.out("Stopping...")
+        self.child.stop()
+        self.child = None
+        self.out("Done!")
+        self.tmp_dir.remove()
+
+    def __del__(self):
+        self.close()
+
+
+class KafkaFixture(Fixture):
+    broker_user = 'alice'
+    broker_password = 'alice-secret'
+
+    @classmethod
+    def instance(cls, broker_id, zookeeper=None, zk_chroot=None,
+                 host="localhost", port=None, external=False,
+                 transport='PLAINTEXT', replicas=1, partitions=4,
+                 sasl_mechanism=None, auto_create_topic=True, tmp_dir=None):
+
+        # Kafka requries zookeeper prior to 4.0 release
+        if env_kafka_version() < (4, 0):
+            if zookeeper is None:
+                if "ZOOKEEPER_URI" in os.environ:
+                    parse = urlparse(os.environ["ZOOKEEPER_URI"])
+                    (host, port) = (parse.hostname, parse.port)
+                    zookeeper = ZookeeperFixture.instance(host=host, port=port, external=True)
+                elif not external:
+                    zookeeper = ZookeeperFixture.instance()
+            if zk_chroot is None:
+                zk_chroot = "kafka-python_" + str(uuid.uuid4()).replace("-", "_")
+
+        fixture = KafkaFixture(host, port, broker_id,
+                               zookeeper=zookeeper, zk_chroot=zk_chroot,
+                               external=external,
+                               transport=transport,
+                               replicas=replicas, partitions=partitions,
+                               sasl_mechanism=sasl_mechanism,
+                               auto_create_topic=auto_create_topic,
+                               tmp_dir=tmp_dir)
+
+        try:
+            fixture.open()
+        except:
+            fixture.close()
+            raise
+        return fixture
+
+    def __init__(self, host, port, broker_id, zookeeper=None, zk_chroot=None,
+                 replicas=1, partitions=2, transport='PLAINTEXT',
+                 sasl_mechanism=None, auto_create_topic=True,
+                 tmp_dir=None, external=False):
+        super().__init__()
+        self.external = external
+        self.running = False
+        self.host = host
+        self.controller_bootstrap_host = host
+        if port is None:
+            self.auto_port = True
+            self.port = get_open_port()
+        else:
+            self.auto_port = False
+            self.port = port
+        self.controller_port = get_open_port()
+
+        self.cluster_id = self._gen_cluster_id()
+        self.broker_id = broker_id
+        self.auto_create_topic = auto_create_topic
+        self.transport = transport.upper()
+        if sasl_mechanism is not None:
+            self.sasl_mechanism = sasl_mechanism.upper()
+            assert self.sasl_enabled, 'sasl_mechanism defined without enabling SASL transport'
+        else:
+            self.sasl_mechanism = None
+            assert not self.sasl_enabled, 'SASL transport requires sasl_mechanism'
+        self.ssl_dir = None
+
+        # TODO: checking for port connection would be better than scanning logs
+        # until then, we need the pattern to work across all supported broker versions
+        # The logging format changed slightly in 1.0.0
+        if env_kafka_version() < (4, 0):
+            self.start_pattern = r"\[Kafka ?Server (id=)?%d\],? started" % (broker_id,)
+            # Need to wait until the broker has fetched user configs from zookeeper in case we use scram as sasl mechanism
+            self.scram_pattern = r"Removing Produce quota for user %s" % (self.broker_user)
+        else:
+            self.start_pattern = r"\[KafkaRaftServer nodeId=%d\] Kafka Server started" % (broker_id,)
+            self.scram_pattern = r"Replayed UserScramCredentialRecord creating new entry for %s" % (self.broker_user,)
+
+        if env_kafka_version() < (0, 9):
+            assert not self.ssl_enabled, 'Kafka broker version %s does not support SSL' % (env_kafka_version(),)
+
+        self.zookeeper = zookeeper
+        self.zk_chroot = zk_chroot
+        # Add the attributes below for the template binding
+        self.zk_host = self.zookeeper.host if self.zookeeper else None
+        self.zk_port = self.zookeeper.port if self.zookeeper else None
+
+        self.replicas = replicas
+        self.partitions = partitions
+
+        self.tmp_dir = tmp_dir
+
+        if self.external:
+            self.child = ExternalService(self.host, self.port)
+            self.running = True
+        else:
+            self.running = False
+
+        self.sasl_config = ''
+        self.ssl_config = ''
+        self.acl_config = ''
+        self.jaas_config = ''
+
+    def _gen_cluster_id(self):
+        return base64.b64encode(uuid.uuid4().bytes).decode('utf-8').rstrip('=')
+
+    def _sasl_config(self):
+        if not self.sasl_enabled:
+            return ''
+
+        sasl_config = (
+            'sasl.enabled.mechanisms={mechanism}\n'
+            'sasl.mechanism.inter.broker.protocol={mechanism}\n'
+        )
+        return sasl_config.format(mechanism=self.sasl_mechanism)
+
+    @property
+    def ssl_enabled(self):
+        return self.transport in ('SSL', 'SASL_SSL')
+
+    def _ssl_config(self):
+        if not self.ssl_enabled:
+            return ''
+        self.ssl_dir = os.path.join(self.tmp_dir.strpath, 'ssl')
+        os.makedirs(self.ssl_dir, exist_ok=True)
+        gen_ssl_resources(self.ssl_dir)
+        return (
+            'ssl.keystore.location={ssl_dir}/kafka.server.keystore.jks\n'
+            'ssl.keystore.password=foobar\n'
+            'ssl.key.password=foobar\n'
+            'ssl.truststore.location={ssl_dir}/kafka.server.truststore.jks\n'
+            'ssl.truststore.password=foobar'
+        ).format(ssl_dir=self.ssl_dir)
+
+    def _acl_config(self):
+        if env_kafka_version() < (0, 9):
+            return ''
+        elif env_kafka_version() < (2, 4):
+            return (
+                'authorizer.class.name=kafka.security.auth.SimpleAclAuthorizer\n'
+                'allow.everyone.if.no.acl.found=true'
+            )
+        elif env_kafka_version() < (4, 0):
+            return (
+                'authorizer.class.name=kafka.security.authorizer.AclAuthorizer\n'
+                'allow.everyone.if.no.acl.found=true'
+            )
+        else:
+            return (
+                'authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer\n'
+                'allow.everyone.if.no.acl.found=true'
+            )
+
+    def _jaas_config(self):
+        if not self.sasl_enabled:
+            return ''
+
+        elif self.sasl_mechanism == 'PLAIN':
+            jaas_config = (
+                'org.apache.kafka.common.security.plain.PlainLoginModule required'
+                ' username="{user}" password="{password}" user_{user}="{password}";\n'
+            )
+        elif self.sasl_mechanism in ("SCRAM-SHA-256", "SCRAM-SHA-512"):
+            jaas_config = (
+                'org.apache.kafka.common.security.scram.ScramLoginModule required'
+                ' username="{user}" password="{password}";\n'
+            )
+        else:
+            raise ValueError("SASL mechanism {} currently not supported".format(self.sasl_mechanism))
+        return jaas_config.format(user=self.broker_user, password=self.broker_password)
+
+    def _add_scram_user(self):
+        self.out("Adding SCRAM credentials for user {} to zookeeper.".format(self.broker_user))
+        args = self.run_script('kafka-configs.sh',
+                               '--zookeeper',
+                               '%s:%d/%s' % (self.zookeeper.host,
+                                          self.zookeeper.port,
+                                          self.zk_chroot),
+                               '--alter',
+                               '--entity-type', 'users',
+                               '--entity-name', self.broker_user,
+                               '--add-config',
+                               '{}=[password={}]'.format(self.sasl_mechanism, self.broker_password))
+        env = self.kafka_run_class_env()
+        proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        stdout, stderr = proc.communicate()
+
+        if proc.returncode != 0:
+            self.out("Failed to save credentials to zookeeper!")
+            self.out(stdout)
+            self.out(stderr)
+            raise RuntimeError("Failed to save credentials to zookeeper!")
+        self.out("User created.")
+
+    @property
+    def sasl_enabled(self):
+        return self.transport in ('SASL_PLAINTEXT', 'SASL_SSL')
+
+    def bootstrap_server(self):
+        return '%s:%d' % (self.host, self.port)
+
+    def kafka_run_class_env(self):
+        env = super().kafka_run_class_env()
+        env['LOG_DIR'] = self.tmp_dir.join('logs').strpath
+        return env
+
+    def out(self, message):
+        if len(log.handlers) > 0:
+            log.info("*** Kafka [%s:%s]: %s", self.host, self.port or '(auto)', message)
+        else:
+            print(message)
+
+    def _create_zk_chroot(self):
+        self.out("Creating Zookeeper chroot node...")
+        args = self.run_script('zookeeper-shell.sh',
+                               '%s:%d' % (self.zookeeper.host,
+                                          self.zookeeper.port),
+                               'create',
+                               '/%s' % (self.zk_chroot,),
+                               'kafka-python')
+        env = self.kafka_run_class_env()
+        proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        stdout, stderr = proc.communicate()
+
+        if proc.returncode != 0:
+            self.out("Failed to create Zookeeper chroot node")
+            self.out(stdout)
+            self.out(stderr)
+            raise RuntimeError("Failed to create Zookeeper chroot node")
+        self.out("Kafka chroot created in Zookeeper!")
+
+    def start(self):
+        if self.running:
+            return True
+        # Configure Kafka child process
+        properties = self.tmp_dir.join("kafka.properties")
+        jaas_conf = self.tmp_dir.join("kafka_server_jaas.conf")
+        properties_template = self.test_resource("kafka.properties")
+        jaas_conf_template = self.test_resource("kafka_server_jaas.conf")
+
+        # Consider replacing w/ run_script('kafka-server-start.sh', ...)
+        args = self.kafka_run_class_args("kafka.Kafka", properties.strpath)
+        env = self.kafka_run_class_env()
+        if self.sasl_enabled:
+            opts = env.get('KAFKA_OPTS', '').strip()
+            opts += ' -Djava.security.auth.login.config={}'.format(jaas_conf.strpath)
+            env['KAFKA_OPTS'] = opts
+            self.render_template(jaas_conf_template, jaas_conf, vars(self))
+
+        timeout = 5
+        max_timeout = 120
+        backoff = 1
+        end_at = time.time() + max_timeout
+        tries = 1
+        while time.time() < end_at:
+            # We have had problems with port conflicts on travis
+            # so we will try a different port on each retry
+            # unless the fixture was passed a specific port
+            if self.auto_port:
+                self.port = get_open_port()
+            self.out('Attempting to start on port %d (try #%d)' % (self.port, tries))
+            self.render_template(properties_template, properties, vars(self))
+
+            self.child = SpawnedService(args, env)
+            self.child.start()
+            timeout = min(timeout, max(end_at - time.time(), 0))
+            if self._broker_ready(timeout) and self._scram_user_present(timeout):
+                break
+
+            self.child.dump_logs()
+            self.child.stop()
+
+            timeout *= 2
+            time.sleep(backoff)
+            tries += 1
+            backoff += 1
+        else:
+            raise RuntimeError('Failed to start KafkaInstance before max_timeout')
+
+        if env_kafka_version() < (0, 9):
+            # broker requires at least one topic for bootstrap to return brokers list
+            log.info('Creating _bootstrap_fixup_ topic for broker %s', (env_kafka_version(),))
+            create_topics(self, ['_bootstrap_fixup_'])
+
+        self.out("Done!")
+        self.running = True
+
+    def _broker_ready(self, timeout):
+        return self.child.wait_for(self.start_pattern, timeout=timeout)
+
+    def _scram_user_present(self, timeout):
+        # no need to wait for scram user if scram is not used
+        if not self.sasl_enabled or not self.sasl_mechanism.startswith('SCRAM-SHA-'):
+            return True
+        return self.child.wait_for(self.scram_pattern, timeout=timeout)
+
+    def open(self):
+        if self.running:
+            self.out("Instance already running")
+            return
+
+        # Create directories
+        if self.tmp_dir is None:
+            self.tmp_dir = py.path.local.mkdtemp() #pylint: disable=no-member
+        self.tmp_dir.ensure(dir=True)
+        self.tmp_dir.ensure('logs', dir=True)
+        self.tmp_dir.ensure('data', dir=True)
+        properties = self.tmp_dir.join('kafka.properties')
+        properties_template = self.test_resource('kafka.properties')
+        self.render_template(properties_template, properties, vars(self))
+
+        self.out("Running local instance...")
+        log.info("  host            = %s", self.host)
+        log.info("  port            = %s", self.port or '(auto)')
+        log.info("  transport       = %s", self.transport)
+        log.info("  sasl_mechanism  = %s", self.sasl_mechanism)
+        log.info("  broker_id       = %s", self.broker_id)
+        log.info("  zk_host         = %s", self.zk_host)
+        log.info("  zk_port         = %s", self.zk_port)
+        log.info("  zk_chroot       = %s", self.zk_chroot)
+        log.info("  replicas        = %s", self.replicas)
+        log.info("  partitions      = %s", self.partitions)
+        log.info("  tmp_dir         = %s", self.tmp_dir.strpath)
+
+        if self.zookeeper:
+            if self.zk_chroot:
+                self._create_zk_chroot()
+            # add user to zookeeper for the first server
+            if self.sasl_enabled and self.sasl_mechanism.startswith("SCRAM-SHA") and self.broker_id == 0:
+                self._add_scram_user()
+
+        else:
+            # running in KRaft mode
+            self._format_log_dirs()
+
+        self.sasl_config = self._sasl_config()
+        self.ssl_config = self._ssl_config()
+        self.acl_config = self._acl_config()
+        self.jaas_config = self._jaas_config()
+        self.start()
+
+        atexit.register(self.close)
+
+    def __del__(self):
+        self.close()
+
+    def stop(self):
+        if self.external:
+            return
+        if not self.running:
+            self.out("Instance already stopped")
+            return
+
+        self.out("Stopping...")
+        self.child.stop()
+        self.child = None
+        self.running = False
+        self.out("Stopped!")
+
+    def close(self):
+        self.stop()
+        if self.tmp_dir is not None:
+            self.tmp_dir.remove()
+            self.tmp_dir = None
+        self.out("Done!")
+
+    def dump_logs(self):
+        super().dump_logs()
+        self.zookeeper.dump_logs()
+
+    def _format_log_dirs(self):
+        self.out("Formatting log dirs for kraft bootstrapping")
+        args = self.run_script('kafka-storage.sh', 'format', '--standalone', '-t', self.cluster_id, '-c', self.tmp_dir.join("kafka.properties"))
+        if self.sasl_enabled and self.sasl_mechanism.startswith("SCRAM-SHA"):
+            args.extend(['--add-scram', '{}=[name={},password={}]'.format(self.sasl_mechanism, self.broker_user, self.broker_password)])
+        env = self.kafka_run_class_env()
+        proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = proc.communicate()
+        if proc.returncode != 0:
+            self.out("Failed to format log dirs for kraft bootstrap!")
+            self.out(stdout)
+            self.out(stderr)
+            raise RuntimeError("Failed to format log dirs!")
+        return True
+
+    def _create_topic_via_cli(self, topic_name, num_partitions, replication_factor):
+        args = self.run_script('kafka-topics.sh',
+                               '--create',
+                               '--topic', topic_name,
+                               '--partitions', self.partitions \
+                                   if num_partitions is None else num_partitions,
+                               '--replication-factor', self.replicas \
+                                   if replication_factor is None \
+                                   else replication_factor,
+                               *self._cli_connect_args())
+        if env_kafka_version() >= (0, 10):
+            args.append('--if-not-exists')
+        env = self.kafka_run_class_env()
+        proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = proc.communicate()
+        if proc.returncode != 0:
+            error = _extract_topic_command_error(stdout)
+            if 'TopicExistsException' not in error and 'already exists' not in error:
+                self.out("Failed to create topic %s" % (topic_name,))
+                self.out(stdout)
+                self.out(stderr)
+                raise RuntimeError(error)
+
+    def _cli_connect_args(self):
+        if env_kafka_version() < (3, 0, 0):
+            return ['--zookeeper', '%s:%s/%s' % (self.zookeeper.host, self.zookeeper.port, self.zk_chroot)]
+        else:
+            args = ['--bootstrap-server', '%s:%s' % (self.host, self.port)]
+            if self.sasl_enabled:
+                command_conf = self.tmp_dir.join("sasl_command.conf")
+                self.render_template(self.test_resource("sasl_command.conf"), command_conf, vars(self))
+                args.append('--command-config')
+                args.append(command_conf.strpath)
+            return args
+
+    def get_topic_names(self):
+        cmd = self.run_script('kafka-topics.sh', '--list', *self._cli_connect_args())
+        env = self.kafka_run_class_env()
+        env.pop('KAFKA_LOG4J_OPTS')
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = proc.communicate()
+        if proc.returncode != 0:
+            self.out("Failed to list topics!")
+            self.out(stdout)
+            self.out(stderr)
+            raise RuntimeError("Failed to list topics!")
+        return stdout.decode().splitlines(False)
+
+    def _enrich_client_params(self, params, **defaults):
+        params = params.copy()
+        for key, value in defaults.items():
+            params.setdefault(key, value)
+        params.setdefault('bootstrap_servers', self.bootstrap_server())
+        params.setdefault('security_protocol', self.transport)
+        if self.sasl_enabled:
+            params.setdefault('sasl_mechanism', self.sasl_mechanism)
+            if self.sasl_mechanism in ('PLAIN', 'SCRAM-SHA-256', 'SCRAM-SHA-512'):
+                params.setdefault('sasl_plain_username', self.broker_user)
+                params.setdefault('sasl_plain_password', self.broker_password)
+        if self.ssl_enabled:
+            params.setdefault('ssl_cafile', os.path.join(self.ssl_dir, 'ca-cert'))
+            params.setdefault('ssl_check_hostname', False)
+        # Run the whole integration suite against a chosen net backend, e.g.
+        # KAFKA_PYTHON_NET=asyncio make test. Unset -> default (selector).
+        # setdefault so a test that pins net= still wins.
+        net = _selected_net()
+        if net:
+            params.setdefault('net', net)
+        return params
+
+
+def get_api_versions():
+    logging.basicConfig(level=logging.ERROR)
+    k = KafkaFixture.instance(0)
+    zk = k.zookeeper
+
+    try:
+        from kafka.admin import KafkaAdminClient
+        client = KafkaAdminClient(bootstrap_servers='localhost:{}'.format(k.port))
+        print(client.api_versions())
+        client.close()
+
+    finally:
+        k.close()
+        if zk:
+            zk.close()
+
+
+def run_brokers(args=()):
+    logging.basicConfig(level=logging.ERROR)
+    params = {}
+    if len(args) == 1 and args[0] == '--sasl':
+        params['transport'] = "SASL_PLAINTEXT"
+        params['sasl_mechanism'] = 'SCRAM-SHA-512'
+    k = KafkaFixture.instance(0, **params)
+    zk = k.zookeeper
+
+    print("Kafka", k.kafka_version, "running on port:", k.port)
+    try:
+        while True:
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("Bye!")
+        k.close()
+        if zk:
+            zk.close()
+
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) < 2:
+        print("Commands: get_api_versions")
+        exit(0)
+    cmd = sys.argv[1]
+    if cmd == 'get_api_versions':
+        get_api_versions()
+    elif cmd == 'kafka':
+        run_brokers(sys.argv[2:])
+    else:
+        print("Unknown cmd: %s", cmd)
+        exit(1)
